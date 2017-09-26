@@ -2,6 +2,10 @@
 # Used by DisplayDriverDummy to wait a full second for "Vsync"
 from time import sleep
 
+# Used by FrameProviderSHM to access shared memory
+import posix_ipc
+import mmap
+
 import opc
 
 class Frame:
@@ -66,6 +70,27 @@ class FrameProviderFlatField(FrameProvider):
     def provide_frame(self):
         return self.theFrame
 
+class FrameProviderSHM(FrameProvider):
+    def __init__(self,width,height,name):
+        super(FrameProviderSHM, self).__init__(width,height)
+        self._shm = posix_ipc.SharedMemory(name,size=(width*height*3), flags=posix_ipc.O_CREAT)
+        self._shmmap = mmap.mmap(self._shm.fd, self._shm.size)
+        self._frame = Frame(width,height)
+
+    def destroy(self):
+        self._shm.unlink()
+
+    def provide_frame(self):
+        shmPos = 0
+        for y in range(0,self._frame.height):
+            for x in range(0,self._frame.width):
+                self._frame.framebuffer[y][x] = (
+                        ord(self._shmmap[shmPos]),
+                        ord(self._shmmap[shmPos+1]),
+                        ord(self._shmmap[shmPos+2]))
+                shmPos += 3;
+        return self._frame;
+        
 
 class FrameProviderMux(FrameProvider):
     
@@ -119,7 +144,7 @@ class DisplayDriverOpenPixel(DisplayDriver):
 
     def __init__(self, server, interval, width, height):
         super(DisplayDriverOpenPixel, self).__init__(width,height)
-        print "OpenPixel: Connecting"
+        print("OpenPixel: Connecting")
         self._interval = interval
         self._opcClient = opc.Client(server,long_connection=True)
         self._opcClient.can_connect()
@@ -142,26 +167,64 @@ class DisplayDriverOpenPixel(DisplayDriver):
 
 class FarnsworthController:
     
+    @staticmethod
+    def handleDbg(fc,message):
+        print("|".join(message))
+
+    def handleHaltCmd(fc,message):
+        fc._halted = bool(message[0])
+
     def __init__(self):
         self.ActiveDisplayDriver = DisplayDriverDummy(1,1)
         self.ActiveFrameProvider = FrameProviderCheckerboard(self.ActiveDisplayDriver.getWidth(),self.ActiveDisplayDriver.getHeight())
+        self.MQ = posix_ipc.MessageQueue("/farnsworth_mq",read=True,write=False,flags=posix_ipc.O_CREAT)
+        self.halted = False
+        self._halt_interval = 1
+        self._message_handlers = {}
+        self.registerHandler('dbg',FarnsworthController.handleDbg)
+        self.registerHandler('halt',FarnsworthController.handleHaltCmd)
+
+    def registerHandler(self,command,fn):
+        if command in self._message_handlers:
+            raise RuntimeError("Command %s already registered" % command)
+        self._message_handlers[command] = fn
 
     def run(self):
         while 1:
-            frame = self.ActiveFrameProvider.provide_frame()
-            #if(self.ActiveDisplayDriver.alwaysDraw or self.ActiveFrameProvider.requires_draw()):
-            #    self.ActiveDisplayDriver.draw(frame)
-            self.ActiveDisplayDriver.draw(frame)
-            self.ActiveFrameProvider.tick()
-            self.ActiveDisplayDriver.wait()
+            if(self.halted):
+                sleep(self._halt_interval)
+            else:
+                frame = self.ActiveFrameProvider.provide_frame()
+                #if(self.ActiveDisplayDriver.alwaysDraw or self.ActiveFrameProvider.requires_draw()):
+                #    self.ActiveDisplayDriver.draw(frame)
+                self.ActiveDisplayDriver.draw(frame)
+                self.ActiveFrameProvider.tick()
+                self.ActiveDisplayDriver.wait()
+            try:
+                queueMessage = self.MQ.receive(0)
+                self.handleMessage(queueMessage[0])
+            except posix_ipc.BusyError:
+                # BusyError is expected if the queue has no messages
+                pass
+
+    def handleMessage(self,message):
+        spl = message.split('|')
+        print(spl)
+        msgCommand = spl.pop(0)
+        if msgCommand in self._message_handlers:
+            self._message_handlers[msgCommand](self,spl)
+        else:
+            print("Unknown command: %s" % msgCommand)
+
 
     @staticmethod
     def main():
         pfc = FarnsworthController()
         pfc.ActiveDisplayDriver = DisplayDriverOpenPixel("localhost:7890",1,95,16)
-        pfc.ActiveFrameProvider = FrameProviderCheckerboard(
+        pfc.ActiveFrameProvider = FrameProviderSHM(
                 pfc.ActiveDisplayDriver.getWidth(),
-                pfc.ActiveDisplayDriver.getHeight()
+                pfc.ActiveDisplayDriver.getHeight(),
+                "/farnsworth_fb_0"
                 )
         pfc.run()
 
